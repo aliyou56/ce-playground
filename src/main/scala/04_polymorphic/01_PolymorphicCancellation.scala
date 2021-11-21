@@ -6,7 +6,6 @@ import cats.effect.{ IO, IOApp }
 import cats.{ Applicative, Monad }
 
 object PolymorphicCancellation extends IOApp.Simple {
-
   trait MyApplicativeError[F[_], E] extends Applicative[F] {
     def raiseError[A](error: E): F[A]
     def handleErrorWith[A](fa: F[A])(f: E => F[A]): F[A]
@@ -66,11 +65,62 @@ object PolymorphicCancellation extends IOApp.Simple {
     }
 
   // bracket pattern is specific to monadCancel
-  val aComputationWithUsage = monadCancelIO.bracket(IO(42)) { value =>
-    IO(s"Using the meaning of life: $value")
-  } { value =>
-    IO("releasing the meaning of life...").void
-  }
+  val aComputationWithUsage =
+    monadCancelIO.bracket(IO(42)) { value =>
+      IO(s"Using the meaning of life: $value")
+    } { value =>
+      IO("releasing the meaning of life...").void
+    }
 
-  override def run: IO[Unit] = ???
+  /**
+   * Exercise - generalize a piece of code
+   */
+  import utils.general.*
+  import scala.concurrent.duration.*
+
+  def unsafeSleep[F[_], E](duration: FiniteDuration)(using mc: MonadCancel[F, E]): F[Unit] =
+    mc.pure(Thread.sleep(duration.toMillis)) // not semantic blocking
+
+  def inputPassword[F[_], E](using mc: MonadCancel[F, E]): F[String] =
+    for {
+      _      <- mc.pure("Input password:").debug
+      _      <- mc.pure("(typing password)").debug
+      _      <- unsafeSleep[F, E](5.seconds)
+      secret <- mc.pure("secret")
+    } yield secret
+
+  def verifyPassword[F[_], E](pw: String)(using mc: MonadCancel[F, E]): F[Boolean] =
+    for {
+      _        <- mc.pure("verifying...").debug
+      _        <- unsafeSleep[F, E](2.seconds)
+      verified <- mc.pure(pw == "secret")
+    } yield verified
+
+  def authFlow[F[_], E](using mc: MonadCancel[F, E]): F[Unit] =
+    mc.uncancelable { poll =>
+      for {
+        pw <- poll(inputPassword)
+          .onCancel(
+            mc.pure("Authentification timed out. Try again later").debug.void
+          ) // cancellable
+        verified <- verifyPassword(pw)
+        _ <-
+          if (verified) mc.pure("Authentification successful").debug
+          else mc.pure("Authentification failed").debug
+      } yield ()
+    }
+
+  def authProgram: IO[Unit] =
+    for {
+      authFib <- authFlow[IO, Throwable].start
+
+      _ <-
+        IO.sleep(3.seconds) >>
+          IO("Authentification timeout, attempting cancel ...").debug >>
+          authFib.cancel
+
+      _ <- authFib.join
+    } yield ()
+
+  override def run: IO[Unit] = authProgram
 }
