@@ -2,8 +2,13 @@ package polymorphic
 
 import scala.concurrent.duration.*
 
-import cats.effect.kernel.{ Deferred, Spawn }
-import cats.effect.{ Concurrent, IO, IOApp, Ref }
+import cats.syntax.flatMap.*
+import cats.syntax.functor.*
+
+import cats.effect.{ IO, IOApp, Concurrent, Ref }
+import cats.effect.kernel.{ Deferred, Fiber, Outcome, Spawn }
+import cats.effect.syntax.monadCancel.* // guaranteeCase extension method
+import cats.effect.syntax.spawn.*       // start extension method
 
 import utils.general.*
 
@@ -22,10 +27,6 @@ object PolymorphicCoordination extends IOApp.Simple {
   val aRef         = concurrentIO.ref(42)
 
   // capabilities: pure, map/flatMap, raiseError, uncancelable, start(fibers) + ref/deferred
-
-  import cats.syntax.flatMap.*
-  import cats.syntax.functor.*
-  import cats.effect.syntax.spawn.*
 
   def polymorphicEggBoiler[F[_]](using concurrent: Concurrent[F]): F[Unit] = {
 
@@ -56,5 +57,42 @@ object PolymorphicCoordination extends IOApp.Simple {
     } yield ()
   }
 
-  override def run: IO[Unit] = polymorphicEggBoiler[IO]
+  /** Exercise: Generalize racePair */
+
+  type RaceResult[F[_], A, B] = Either[
+    (Outcome[F, Throwable, A], Fiber[F, Throwable, B]),
+    (Fiber[F, Throwable, A], Outcome[F, Throwable, B]),
+  ]
+
+  type EitherOutcome[F[_], A, B] =
+    Either[Outcome[F, Throwable, A], Outcome[F, Throwable, B]]
+
+  def polymorphicRacePair[F[_], A, B](fa: F[A],fb: F[B])(
+    using concurrent: Concurrent[F]
+  ): F[RaceResult[F, A, B]] =
+    concurrent.uncancelable { poll =>
+      for {
+        signal <- concurrent.deferred[EitherOutcome[F, A, B]]
+        fibA   <- fa.guaranteeCase(outcomeA => signal.complete(Left(outcomeA)).void).start
+        fibB   <- fb.guaranteeCase(outcomeB => signal.complete(Right(outcomeB)).void).start
+        result <- poll(signal.get).onCancel {
+          for {
+            cancelFibA <- fibA.cancel.start
+            cancelFibB <- fibB.cancel.start
+            _          <- cancelFibA.join
+            _          <- cancelFibB.join
+          } yield ()
+        }
+      } yield result match {
+        case Left(outcomeA)  => Left(outcomeA -> fibB)
+        case Right(outcomeB) => Right(fibA -> outcomeB)
+      }
+    }
+
+  override def run: IO[Unit] =
+    // polymorphicEggBoiler[IO]
+    polymorphicRacePair[IO, Int, Int](
+      IO("computation 1").debug >> IO.sleep(1.second) >> IO(42),
+      IO("computation 2").debug >> IO.sleep(2.seconds) >> IO(24),
+    ).debug.void
 }
